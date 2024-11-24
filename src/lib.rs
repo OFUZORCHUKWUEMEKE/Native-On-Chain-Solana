@@ -10,6 +10,8 @@ use solana_program::{
     sysvar::Sysvar,
 };
 pub mod instruction;
+mod example;
+mod client;
 mod state;
 use instruction::MovieInstruction;
 use state::*;

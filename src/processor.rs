@@ -1,6 +1,6 @@
-use crate::{error::ReviewError, state::MovieCommentCounter};
 use crate::instruction::MovieInstruction;
-use crate::state::MovieAccountState;
+use crate::state::{MovieAccountState, MovieComment};
+use crate::{error::ReviewError, state::MovieCommentCounter};
 use borsh::BorshSerialize;
 use solana_program::borsh1::try_from_slice_unchecked;
 use solana_program::program::invoke;
@@ -56,41 +56,43 @@ pub fn add_movie_review(
 
     let initializer = next_account_info(account_info_iter)?;
     let pda_account = next_account_info(account_info_iter)?;
-    let pda_counter = next_account_info(account_info_iter)?;
+    let token_mint = next_account_info(account_info_iter)?;
+    let mint_auth = next_account_info(account_info_iter)?;
+    let user_ata = next_account_info(account_info_iter)?;
     let system_program = next_account_info(account_info_iter)?;
+    let token_program = next_account_info(account_info_iter)?;
 
+    // Validate signer
     if !initializer.is_signer {
         msg!("Missing required signature");
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    let (.as_ref(),"comment".as_ref(), bump_seed) =; Pubkey::find_program_address(
+    // Derive and validate PDA
+    let (pda, bump_seed) = Pubkey::find_program_address(
         &[initializer.key.as_ref(), title.as_bytes().as_ref()],
         program_id,
     );
     if pda != *pda_account.key {
         msg!("Invalid seeds for PDA");
-        return Err(ProgramError::InvalidArgument);
+        return Err(ReviewError::InvalidPDA.into());
     }
 
+    // Validate rating
     if rating > 5 || rating < 1 {
         msg!("Rating cannot be higher than 5");
         return Err(ReviewError::InvalidRating.into());
     }
 
-    let total_len: usize = 1 + 1 + (4 + title.len()) + (4 + description.len());
-    if total_len > 1000 {
-        msg!("Data length is larger than 1000 bytes");
-        return Err(ReviewError::InvalidDataLength.into());
-    }
-
+    // Validate data length
     let account_len: usize = 1000;
-
-    if MovieAccountState::get_account_size(title.clone(), description.clone()) > account_len {
+    let total_len: usize = MovieAccountState::get_account_size(title.clone(), description.clone());
+    if total_len > account_len {
         msg!("Data length is larger than 1000 bytes");
         return Err(ReviewError::InvalidDataLength.into());
     }
 
+    // Calculate rent and create account
     let rent = Rent::get()?;
     let rent_lamports = rent.minimum_balance(account_len);
 
@@ -116,52 +118,71 @@ pub fn add_movie_review(
 
     msg!("PDA created: {}", pda);
 
-    msg!("unpacking state account");
-    let mut account_data =
-        try_from_slice_unchecked::<MovieAccountState>(&pda_account.data.borrow()).unwrap();
-    msg!("borrowed account data");
+    // Deserialize and initialize account data
+    msg!("Unpacking state account");
+    let mut account_data = MovieAccountState::try_from_slice(&pda_account.data.borrow())?;
+    msg!("Borrowed account data");
 
-    msg!("checking if movie account is already initialized");
+    msg!("Checking if movie account is already initialized");
     if account_data.is_initialized() {
         msg!("Account already initialized");
         return Err(ProgramError::AccountAlreadyInitialized);
     }
 
+    // Set account data
+    account_data.discriminator = MovieAccountState::DISCRIMINATOR.to_string();
+    account_data.reviewer = *initializer.key;
     account_data.title = title;
     account_data.rating = rating;
     account_data.description = description;
     account_data.is_initialized = true;
 
-    msg!("serializing account");
+    // Serialize account data
+    msg!("Serializing account");
     account_data.serialize(&mut &mut pda_account.data.borrow_mut()[..])?;
-    msg!("state account serialized");
+    msg!("State account serialized");
 
-    msg!("create comment counter");
-    let rent = Rent::get()?;
-    let counter_rent_lamports = rent.minimum_balance(MovieCommentCounter::SIZE);
+    create_comment_counter(program_id, accounts, pda)?;
 
-    let (counter,counter_bump) = Pubkey::find_program_address(&[pda.as_ref(),"comment".as_ref()], program_id);
-    if counter != *pda_account.key{
-        msg!("Invalid Seeds for PDA");
-        return Err(ProgramError::InvalidArgument);
+    // Mint tokens for adding a review
+    msg!("Deriving mint authority");
+    let (mint_pda, _mint_bump) = Pubkey::find_program_address(&[b"token_mint"], program_id);
+    let (mint_auth_pda, mint_auth_bump) =
+        Pubkey::find_program_address(&[b"token_auth"], program_id);
+
+    if *token_mint.key != mint_pda {
+        msg!("Incorrect token mint");
+        return Err(ReviewError::IncorrectAccountError.into());
     }
 
-    invoke(
-        &system_instruction::create_account(initializer.key, pda_counter.key, counter_rent_lamports, MovieCommentCounter::SIZE.try_into().unwrap(), program_id), &[initializer.clone(),pda_counter.clone(),system_program.cloner()],&[&[pda.as_ref(),"comment".as_ref(),&[counter_bump]]]);
+    if *mint_auth.key != mint_auth_pda {
+        msg!("Mint passed in and mint derived do not match");
+        return Err(ReviewError::InvalidPDA.into());
+    }
 
-        msg!("comment counter created");
-        let mut counter_data = try_from_slice_unchecked::<MovieCommentCounter>(&pda_counter.data.borrow()).unwrap();
+    if *user_ata.key != get_associated_token_address(initializer.key, token_mint.key) {
+        msg!("Incorrect associated token account for initializer");
+        return Err(ReviewError::IncorrectAccountError.into());
+    }
 
-        msg!("checking if counter account is already initialized");
-if counter_data.is_initialized() {
-    msg!("Account already initialized");
-    return Err(ProgramError::AccountAlreadyInitialized);
-    counter_data.discriminator = MovieCommentCounter::DISCRIMINATOR.to_string();
-counter_data.counter = 0;
-counter_data.is_initialized = true;
-msg!("comment count: {}", counter_data.counter);
-counter_data.serialize(&mut &mut pda_counter.data.borrow_mut()[..])?;
-}
+    if *token_program.key != TOKEN_PROGRAM_ID {
+        msg!("Incorrect token program");
+        return Err(ReviewError::IncorrectAccountError.into());
+    }
+
+    msg!("Minting 10 tokens to User associated token account");
+    invoke_signed(
+        &spl_token::instruction::mint_to(
+            token_program.key,
+            token_mint.key,
+            user_ata.key,
+            mint_auth.key,
+            &[],
+            10 * LAMPORTS_PER_SOL,
+        )?,
+        &[token_mint.clone(), user_ata.clone(), mint_auth.clone()],
+        &[&[b"token_auth", &[mint_auth_bump]]],
+    )?;
 
     Ok(())
 }
@@ -169,160 +190,208 @@ counter_data.serialize(&mut &mut pda_counter.data.borrow_mut()[..])?;
 pub fn update_movie_review(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
-    _title: String,
+    title: String,
     rating: u8,
     description: String,
 ) -> ProgramResult {
-    msg!("Updating movie review ...");
+    msg!("Updating movie review...");
 
     let account_info_iter = &mut accounts.iter();
-
     let initializer = next_account_info(account_info_iter)?;
     let pda_account = next_account_info(account_info_iter)?;
 
+    // Validate account ownership and signer
     if pda_account.owner != program_id {
         return Err(ProgramError::IllegalOwner);
     }
-
     if !initializer.is_signer {
         msg!("Missing required signature");
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    msg!("unpacking state account");
+    // Deserialize account data
+    msg!("Unpacking state account");
+    let mut account_data = MovieAccountState::try_from_slice(&pda_account.data.borrow())?;
+    msg!("Review title: {}", account_data.title);
 
-    let mut account_data =
-        try_from_slice_unchecked::<MovieAccountState>(&pda_account.data.borrow()).unwrap();
-    msg!("review title: {}", account_data.title);
-
-    let (.as_ref(),"comment".as_ref(), _bump_seed) ;= Pubkey::find_program_address(
+    // Validate PDA
+    let (pda, _bump_seed) = Pubkey::find_program_address(
         &[
             initializer.key.as_ref(),
             account_data.title.as_bytes().as_ref(),
         ],
         program_id,
     );
-
-    if .as_ref(),"comment".as_ref() != *pda_accou;nt.key {
+    if pda != *pda_account.key {
         msg!("Invalid seeds for PDA");
         return Err(ReviewError::InvalidPDA.into());
     }
 
-    msg!("checking if movie account is initialized");
+    // Check account initialization
+    msg!("Checking if movie account is initialized");
     if !account_data.is_initialized() {
         msg!("Account is not initialized");
         return Err(ReviewError::UninitializedAccount.into());
     }
 
+    // Validate rating
     if rating > 5 || rating < 1 {
         msg!("Invalid Rating");
         return Err(ReviewError::InvalidRating.into());
     }
 
-    let update_len: usize = 1 + 1 + (4 + description.len()) + account_data.title.len();
+    // Check data length
+    let update_len = MovieAccountState::get_account_size(title, description.clone());
     if update_len > 1000 {
         msg!("Data length is larger than 1000 bytes");
         return Err(ReviewError::InvalidDataLength.into());
     }
 
+    // Log review details before update
     msg!("Review before update:");
     msg!("Title: {}", account_data.title);
     msg!("Rating: {}", account_data.rating);
     msg!("Description: {}", account_data.description);
-    account_data.discriminator = MovieAccountState::DISCRIMINATOR.to_string();
-    account_data.reviewer = *initializer.key;
 
-    account_data.title = title;
+    // Update account data
     account_data.rating = rating;
     account_data.description = description;
-    account_data.is_initialized = true;
 
+    // Log review details after update
     msg!("Review after update:");
     msg!("Title: {}", account_data.title);
     msg!("Rating: {}", account_data.rating);
     msg!("Description: {}", account_data.description);
 
-    msg!("serializing account");
+    // Serialize updated account data
+    msg!("Serializing account");
     account_data.serialize(&mut &mut pda_account.data.borrow_mut()[..])?;
-    msg!("state account serialized");
+    msg!("State account serialized");
 
     Ok(())
 }
 
-pub fn add_comment(
+fn create_comment_counter(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
-    comment:String
-)->ProgramResult {
-    msg!("Adding comment");
-    msg!("Comment");
-
+    pda: Pubkey,
+) -> ProgramResult {
+    msg!("Creating comment counter");
     let account_info_iter = &mut accounts.iter();
- 
-    let commenter = next_account_info(account_info_iter)?;
-    let pda_review = next_account_info(account_info_iter)?;
+    let initializer = next_account_info(account_info_iter)?;
     let pda_counter = next_account_info(account_info_iter)?;
-    let pda_comment = next_account_info(account_info_iter)?;
     let system_program = next_account_info(account_info_iter)?;
 
-    let mut counter_data =
-    try_from_slice_unchecked::<MovieCommentCounter>(&pda_counter.data.borrow()).unwrap();
-    let account_len = MovieComment::get_account_size(comment.clone());
-
     let rent = Rent::get()?;
-    let rent_lamports = rent.minimum_balance(account_len);
- 
-    let (pda, bump_seed) = Pubkey::find_program_address(
-        &[
-            pda_review.key.as_ref(),
-            counter_data.counter.to_be_bytes().as_ref(),
-        ],
-        program_id,
-    );
-    if pda != *pda_comment.key {
+    let counter_rent_lamports = rent.minimum_balance(MovieCommentCounter::SIZE);
+
+    let (counter, counter_bump) =
+        Pubkey::find_program_address(&[pda.as_ref(), "comment".as_ref()], program_id);
+    if counter != *pda_counter.key {
         msg!("Invalid seeds for PDA");
-        return Err(ReviewError::InvalidPDA.into());
+        return Err(ProgramError::InvalidArgument);
     }
+
     invoke_signed(
         &system_instruction::create_account(
-            commenter.key,
-            pda_comment.key,
-            rent_lamports,
-            account_len.try_into().unwrap(),
+            initializer.key,
+            pda_counter.key,
+            counter_rent_lamports,
+            MovieCommentCounter::SIZE.try_into().unwrap(),
             program_id,
         ),
         &[
-            commenter.clone(),
-            pda_comment.clone(),
+            initializer.clone(),
+            pda_counter.clone(),
             system_program.clone(),
         ],
-        &[&[
-            pda_review.key.as_ref(),
-            counter_data.counter.to_be_bytes().as_ref(),
-            &[bump_seed],
-        ]],
+        &[&[pda.as_ref(), "comment".as_ref(), &[counter_bump]]],
+    )?;
+    msg!("Comment counter created");
+
+    let mut counter_data = MovieCommentCounter::try_from_slice(&pda_counter.data.borrow())?;
+
+    msg!("Checking if counter account is already initialized");
+    if counter_data.is_initialized() {
+        msg!("Account already initialized");
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
+
+    counter_data.discriminator = MovieCommentCounter::DISCRIMINATOR.to_string();
+    counter_data.counter = 0;
+    counter_data.is_initialized = true;
+    msg!("Comment count: {}", counter_data.counter);
+    counter_data.serialize(&mut &mut pda_counter.data.borrow_mut()[..])?;
+
+    Ok(())
+}
+
+pub fn initialize_token_mint(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+
+    let initializer = next_account_info(account_info_iter)?;
+    let token_mint = next_account_info(account_info_iter)?;
+    let mint_auth = next_account_info(account_info_iter)?;
+    let system_program = next_account_info(account_info_iter)?;
+    let token_program = next_account_info(account_info_iter)?;
+    let sysvar_rent = next_account_info(account_info_iter)?;
+
+    let (mint_pda, mint_bump) = Pubkey::find_program_address(&[b"token_mint"], program_id);
+    let (mint_auth_pda, _mint_auth_bump) =
+        Pubkey::find_program_address(&[b"token_auth"], program_id);
+
+    msg!("Token mint: {:?}", mint_pda);
+    msg!("Mint authority: {:?}", mint_auth_pda);
+
+    if mint_pda != *token_mint.key {
+        msg!("Incorrect token mint account");
+        return Err(ReviewError::IncorrectAccountError.into());
+    }
+
+    if *token_program.key != TOKEN_PROGRAM_ID {
+        msg!("Incorrect token program");
+        return Err(ReviewError::IncorrectAccountError.into());
+    }
+
+    if *mint_auth.key != mint_auth_pda {
+        msg!("Incorrect mint auth account");
+        return Err(ReviewError::IncorrectAccountError.into());
+    }
+
+    let rent = Rent::get()?;
+    let rent_lamports = rent.minimum_balance(82);
+
+    invoke_signed(
+        &system_instruction::create_account(
+            initializer.key,
+            token_mint.key,
+            rent_lamports,
+            82,
+            token_program.key,
+        ),
+        &[
+            initializer.clone(),
+            token_mint.clone(),
+            system_program.clone(),
+        ],
+        &[&[b"token_mint", &[mint_bump]]],
     )?;
 
-    let mut comment_data =
-    try_from_slice_unchecked::<MovieComment>(&pda_comment.data.borrow()).unwrap();
+    msg!("Created token mint account");
 
-msg!("checking if comment account is already initialized");
-if comment_data.is_initialized() {
-    msg!("Account already initialized");
-    return Err(ProgramError::AccountAlreadyInitialized);
-}
-comment_data.discriminator = MovieComment::DISCRIMINATOR.to_string();
-    comment_data.review = *pda_review.key;
-    comment_data.commenter = *commenter.key;
-    comment_data.comment = comment;
-    comment_data.is_initialized = true;
-    comment_data.serialize(&mut &mut pda_comment.data.borrow_mut()[..])?;
- 
-    msg!("Comment Count: {}", counter_data.counter);
-    counter_data.counter += 1;
-    counter_data.serialize(&mut &mut pda_counter.data.borrow_mut()[..])?;
- 
+    invoke_signed(
+        &initialize_mint(
+            token_program.key,
+            token_mint.key,
+            mint_auth.key,
+            Option::None,
+            9,
+        )?,
+        &[token_mint.clone(), sysvar_rent.clone(), mint_auth.clone()],
+        &[&[b"token_mint", &[mint_bump]]],
+    )?;
+
+    msg!("Initialized token mint");
+
     Ok(())
-
-Ok(())
 }

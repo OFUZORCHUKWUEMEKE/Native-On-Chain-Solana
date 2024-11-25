@@ -11,8 +11,10 @@ use solana_program::{
 };
 pub mod instruction;
 mod example;
+mod error;
 mod client;
 mod state;
+mod processor;
 use instruction::MovieInstruction;
 use state::*;
 

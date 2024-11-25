@@ -61,10 +61,10 @@ impl MovieCommentCounter {
     pub const DISCRIMINATOR: &'static str = "counter";
     pub const SIZE: usize = (4 + MovieCommentCounter::DISCRIMINATOR.len()) + 1 + 8;
 }
- 
+
 impl MovieComment {
     pub const DISCRIMINATOR: &'static str = "comment";
- 
+
     pub fn get_account_size(comment: String) -> usize {
         return (4 + MovieComment::DISCRIMINATOR.len()) + 1 + 32 + 32 + (4 + comment.len()) + 8;
     }

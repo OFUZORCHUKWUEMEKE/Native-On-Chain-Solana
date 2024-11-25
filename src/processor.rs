@@ -37,6 +37,7 @@ pub fn process_instruction(
             description,
         } => update_movie_review(program_id, accounts, title, rating, description),
         MovieInstruction::AddComment { comment } => add_comment(program_id, accounts, comment),
+        MovieInstruction::InitializeMint => initialize_token_mint(program_id, accounts),
     }
 }
 

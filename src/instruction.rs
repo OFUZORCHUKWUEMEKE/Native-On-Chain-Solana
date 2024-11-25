@@ -7,6 +7,11 @@ pub enum MovieInstruction {
         rating: u8,
         description: String,
     },
+    UpdateMovieReview {
+        title: String,
+        rating: u8,
+        description: String,
+    },
 }
 
 #[derive(BorshDeserialize)]
@@ -17,24 +22,23 @@ struct MovieReviewPayload {
 }
 
 impl MovieInstruction {
-    // Unpack inbound buffer to associated Instruction
-    // The expected format for input is a Borsh serialized vector
     pub fn unpack(input: &[u8]) -> Result<Self, ProgramError> {
-        // Ensure the input is not empty and split off the first byte (instruction variant)
         let (&variant, rest) = input
             .split_first()
             .ok_or(ProgramError::InvalidInstructionData)?;
-        // Attempt to deserialize the remaining input into a MovieReviewPayload
-        let payload = MovieReviewPayload::try_from_slice(rest)
-            .map_err(|_| ProgramError::InvalidInstructionData)?;
-        match variant {
-            0 => Ok(Self::AddMovieReview {
+        let payload = MovieReviewPayload::try_from_slice(rest).unwrap();
+        Ok(match variant {
+            0 => Self::AddMovieReview {
                 title: payload.title,
                 rating: payload.rating,
                 description: payload.description,
-            }),
-            // If the variant doesn't match any known instruction, return an error
-            _ => Err(ProgramError::InvalidInstructionData),
-        }
+            },
+            1 => Self::UpdateMovieReview {
+                title: payload.title,
+                rating: payload.rating,
+                description: payload.description,
+            },
+            _ => return Err(ProgramError::InvalidInstructionData),
+        })
     }
 }

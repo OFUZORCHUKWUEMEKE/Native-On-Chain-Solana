@@ -347,6 +347,7 @@ pub fn initialize_token_mint(program_id: &Pubkey, accounts: &[AccountInfo]) -> P
     if mint_pda != *token_mint.key {
         msg!("Incorrect token mint account");
         return Err(ReviewError::IncorrectAccountError.into());
+        // error
     }
 
     if *token_program.key != TOKEN_PROGRAM_ID {
